@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>테스트용 바코드</title>
+<style>
+  body { margin: 0; padding: 16px; background: #fff; color: #111; font-family: system-ui, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 1.3rem; }
+  p { color: #555; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; }
+  figure { margin: 0; border: 1px solid #ddd; border-radius: 12px; padding: 12px; text-align: center; }
+  figcaption { margin-top: 6px; font-size: .9rem; }
+  svg { width: 100%; height: auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>테스트용 바코드</h1>
+  <p>컴퓨터 화면이나 인쇄물에 띄워 두고 휴대폰으로 스캔해 보세요. products.csv의 상품과 연결돼 있어요.</p>
+  <div class="grid" id="grid"></div>
+</main>
+<script>
+// EAN-13 바코드를 SVG로 그림 (외부 라이브러리 없음)
+const L = ['0001101','0011001','0010011','0111101','0100011','0110001','0101111','0111011','0110111','0001011'];
+const G = L.map(p => [...p].map(b => b === '0' ? '1' : '0').reverse().join(''));
+const R = L.map(p => [...p].map(b => b === '0' ? '1' : '0').join(''));
+const PARITY = ['LLLLLL','LLGLGG','LLGGLG','LLGGGL','LGLLGG','LGGLLG','LGGGLL','LGLGLG','LGLGGL','LGGLGL'];
+function ean13Bits(code) {
+  const d = code.split('').map(Number);
+  let bits = '101';
+  for (let i = 1; i <= 6; i++) bits += (PARITY[d[0]][i - 1] === 'L' ? L : G)[d[i]];
+  bits += '01010';
+  for (let i = 7; i <= 12; i++) bits += R[d[i]];
+  return bits + '101';
+}
+function ean13Svg(code) {
+  const bits = ean13Bits(code), q = 11, w = bits.length + q * 2, h = 70;
+  let rects = '';
+  [...bits].forEach((b, i) => { if (b === '1') rects += `<rect x="${i + q}" y="4" width="1" height="${h - 14}"/>`; });
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" shape-rendering="crispEdges"><rect width="${w}" height="${h}" fill="#fff"/><g fill="#000">${rects}</g><text x="${w / 2}" y="${h - 1}" font-size="9" text-anchor="middle" font-family="monospace">${code}</text></svg>`;
+}
+(async () => {
+  let list = window.PRODUCTS_INLINE;
+  if (!list) {
+    try {
+      const rows = (await (await fetch('products.csv')).text()).replace(/^\uFEFF/, '').split(/\r?\n/).slice(1);
+      list = rows.filter(Boolean).map((r) => { const m = r.match(/^([^,]*),("(?:[^"]|"")*"|[^,]*)/); return { barcode: m[1], name: m[2].replace(/^"|"$/g, '').replace(/""/g, '"') }; });
+    } catch { list = []; }
+  }
+  const grid = document.getElementById('grid');
+  for (const p of list) {
+    // 12자리 UPC-A는 앞에 0을 붙인 EAN-13과 같은 바코드
+    const code = /^\d{12}$/.test(p.barcode) ? '0' + p.barcode : p.barcode;
+    if (!/^\d{13}$/.test(code)) continue;
+    const f = document.createElement('figure');
+    f.innerHTML = ean13Svg(code);
+    const c = document.createElement('figcaption'); c.textContent = p.name; f.append(c);
+    grid.append(f);
+  }
+})();
+</script>
+</body>
+</html>
