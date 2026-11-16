@@ -2,7 +2,7 @@
 window.BARCODE_SETTINGS = {
   // 관리자 모드: 구글시트에 붙인 Apps Script 웹 앱 주소 (https://script.google.com/macros/s/…/exec)
   // 넣으면 데이터도 여기서 읽고, 관리자 비밀번호로 웹에서 바로 상품을 고칠 수 있어요. 시트를 공개할 필요 없음
-  adminApiUrl: '',
+  adminApiUrl: 'https://script.google.com/macros/s/AKfycbz24d9GrviklW5fqovdAjO8P_I0P77pBdGxLUISr7U6KkPeyynsnOOPe0XDJ4eVW2TV/exec',
 
   // 관리자 모드 없이 읽기만: "링크가 있는 모든 사용자"로 공유한 구글시트 주소
   sheetCsvUrl: '',
