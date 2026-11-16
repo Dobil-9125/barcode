@@ -199,7 +199,8 @@
   }
   const sizeOf = (p) => p.size || splitName(p.name).size;
   const baseOf = (p) => splitName(p.name).base;
-  const normEn = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim();
+  // Entrée → ENTREE 처럼 악센트는 떼고 비교
+  const normEn = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim();
   const groupKey = (p) => p.english
     ? 'en:' + normEn(p.english.split('|')[0])
     : 'ko:' + baseOf(p).replace(/[\s&+·,.]/g, '').replace(/[\d.]+$/, '');
@@ -820,25 +821,35 @@
     }
     return v[b.length];
   }
-  const tokens = (s) => normEn(s).split(' ').filter((t) => t.length >= 3 || /^\d+$/.test(t));
+  // 같은 뜻의 포장 문구를 하나로 (CANINE/DOGS → DOG, FELINE/CATS → CAT)
+  const SYN = { DOGS: 'DOG', CANINE: 'DOG', PUPPIES: 'PUPPY', CATS: 'CAT', FELINE: 'CAT', KITTENS: 'KITTEN' };
+  const tokens = (s) => normEn(s).split(' ').map((t) => SYN[t] || t).filter((t) => t.length >= 3 || /^\d+$/.test(t));
 
   // 사진에서 읽은 글자와 각 묶음의 영문명을 비교해 점수 순으로
   function matchGroups(text) {
     const seen = tokens(text);
     if (!seen.length) return [];
+    // 글자가 띄어져 읽힌 경우(Nutri Source → NUTRISOURCE)도 맞추도록 붙인 낱말도 추가
+    const raw = normEn(text).split(' ');
+    for (let i = 0; i + 1 < raw.length; i++) if (raw[i].length >= 2 && raw[i + 1].length >= 2) seen.push(raw[i] + raw[i + 1]);
     const entries = [];
     for (const [key, list] of groups) {
       const en = list.find((p) => p.english);
       if (!en) continue;
       for (const alias of en.english.split('|')) {
         const t = [...new Set(tokens(alias))];
-        if (t.length) entries.push({ key, list, t });
+        if (t.length) entries.push({ key, list, t, brand: t[0] });
       }
     }
     // 여러 상품에 공통인 단어(브랜드명 등)는 덜 중요하게
     const df = new Map();
     for (const e of entries) for (const w of e.t) df.set(w, (df.get(w) || 0) + 1);
     const idf = (w) => Math.log(1 + entries.length / (df.get(w) || 1));
+    const near = (w) => seen.some((s) => Math.abs(s.length - w.length) <= 2 && 1 - lev(s, w) / Math.max(s.length, w.length) >= 0.8);
+    // 브랜드 글자(영문명 첫 단어)가 보이면 다른 브랜드 상품은 낮추기
+    const brands = new Set(entries.map((e) => e.brand).filter(near));
+    // 강아지/고양이가 한쪽만 보이면 반대쪽 상품은 낮추기
+    const dog = near('DOG') || near('PUPPY'), cat = near('CAT') || near('KITTEN');
     const best = new Map();
     for (const e of entries) {
       let got = 0, total = 0;
@@ -853,7 +864,11 @@
         }
         if (sim >= 0.7) got += weight * sim;
       }
-      const score = total ? got / total : 0;
+      let score = total ? got / total : 0;
+      if (brands.size && !brands.has(e.brand)) score *= 0.6;
+      const eDog = e.t.includes('DOG') || e.t.includes('PUPPY'), eCat = e.t.includes('CAT') || e.t.includes('KITTEN');
+      if (dog && !cat && eCat && !eDog) score *= 0.7;
+      if (cat && !dog && eDog && !eCat) score *= 0.7;
       if (score > (best.get(e.key)?.score || 0)) best.set(e.key, { score, list: e.list });
     }
     const ranked = [...best.values()].filter((x) => x.score >= 0.3).sort((a, b) => b.score - a.score);
@@ -863,10 +878,13 @@
 
   async function prepareForOcr(file) {
     const img = await loadImage(file);
-    const scale = Math.min(1, 1600 / Math.max(img.width, img.height));
+    // 큰 사진은 1600px로 줄이고, 작은 사진(인터넷 이미지 등)은 키워야 글자를 읽음
+    const m = Math.max(img.width, img.height);
+    const scale = m > 1600 ? 1600 / m : m < 1200 ? Math.min(4, 1400 / m) : 1;
     const c = document.createElement('canvas');
     c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
     const ctx = c.getContext('2d');
+    ctx.imageSmoothingQuality = 'high';
     ctx.filter = 'grayscale(1) contrast(1.3)';
     ctx.drawImage(img, 0, 0, c.width, c.height);
     return c;
