@@ -12,7 +12,7 @@
   <header>
     <h1>바코드 조회</h1>
     <p class="admin-badge" id="adminBadge" hidden>관리자 모드 · 상품을 바로 고칠 수 있어요</p>
-    <p class="sub">바코드를 비추거나 포장을 찍으면 상품과 용량별 가격을 보여줘요.</p>
+    <p class="sub">카메라로 바코드나 포장을 비추기만 하면 상품과 용량별 가격을 보여줘요.</p>
   </header>
 
   <section class="scanner" aria-label="스캐너">
@@ -22,8 +22,8 @@
     </div>
     <p class="status" id="status" role="status">아래 버튼을 눌러 시작하세요.</p>
     <div class="actions">
-      <button class="primary" id="btnCamera" type="button">카메라로 스캔</button>
-      <label class="secondary" for="photo">사진으로 찍기</label>
+      <button class="primary" id="btnCamera" type="button">카메라로 찾기</button>
+      <label class="secondary" for="photo">바코드 사진 찍기</label>
       <input id="photo" type="file" accept="image/*" capture="environment" hidden>
       <label class="secondary wide" for="packPhoto" id="packLabel">포장 사진으로 찾기 (영어 이름)</label>
       <input id="packPhoto" type="file" accept="image/*" capture="environment" hidden>

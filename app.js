@@ -634,17 +634,19 @@
     } catch { /* 초점 설정 미지원 */ }
     running = true;
     els.btnCamera.textContent = '카메라 끄기';
-    setStatus('바코드를 네모 칸 안에 가로로 맞춰 주세요.');
+    const ocrOn = startLiveOcr();
+    setStatus(ocrOn ? '바코드나 포장의 영어 이름을 비춰 주세요. 찾으면 바로 넘어가요.' : '바코드를 네모 칸 안에 가로로 맞춰 주세요.');
     requestAnimationFrame(tick);
   }
 
   function stopCamera() {
     running = false;
+    stopLiveOcr();
     if (stream) stream.getTracks().forEach((t) => t.stop());
     stream = null;
     els.video.srcObject = null;
     els.viewport.hidden = true;
-    els.btnCamera.textContent = '카메라로 스캔';
+    els.btnCamera.textContent = '카메라로 찾기';
   }
 
   let lastTick = 0;
@@ -671,6 +673,56 @@
       }
       if (code) onDetected(code);
     } catch { /* 다음 프레임에서 다시 */ } finally { busy = false; }
+  }
+
+  /* 카메라를 비추는 동안 포장 글자도 계속 읽다가, 확실하면 바로 결과로 넘어감 */
+  let liveOcr = false, ocrBusy = false, ocrTimer = 0, lastPick = null, lastShownKey = '', lastShownAt = 0;
+  const ocrFrame = document.createElement('canvas');
+  function startLiveOcr() {
+    if (window.PREVIEW_NO_OCR || !window.Tesseract) return false;
+    if (![...groups.values()].some((l) => l.some((p) => p.english))) return false;
+    liveOcr = true; lastPick = null;
+    getOcr().catch(() => { liveOcr = false; });
+    clearTimeout(ocrTimer);
+    ocrTimer = setTimeout(ocrLoop, 600);
+    return true;
+  }
+  function stopLiveOcr() { liveOcr = false; clearTimeout(ocrTimer); }
+  async function ocrLoop() {
+    if (!running || !liveOcr) return;
+    const v = els.video;
+    if (!ocrBusy && v.readyState >= 2 && v.videoWidth) {
+      ocrBusy = true;
+      try {
+        const worker = await getOcr();
+        const scale = Math.min(1, 1280 / Math.max(v.videoWidth, v.videoHeight));
+        ocrFrame.width = Math.round(v.videoWidth * scale); ocrFrame.height = Math.round(v.videoHeight * scale);
+        const c = ocrFrame.getContext('2d');
+        c.filter = 'grayscale(1) contrast(1.3)';
+        c.drawImage(v, 0, 0, ocrFrame.width, ocrFrame.height);
+        const { data } = await worker.recognize(ocrFrame);
+        if (running && liveOcr) judgeLive(data.text || '');
+      } catch { /* 다음 번에 다시 */ } finally { ocrBusy = false; }
+    }
+    if (running && liveOcr) ocrTimer = setTimeout(ocrLoop, 250);
+  }
+  // 잘못 넘어가지 않게: 한 번에 아주 확실하거나, 같은 상품이 두 번 연속 1등일 때만 넘어감
+  function judgeLive(text) {
+    const found = matchGroups(text);
+    const top = found[0];
+    if (!top) { lastPick = null; return; }
+    const key = groupKey(top.list[0]);
+    const clear = !found[1] || top.score >= found[1].score * 1.25;
+    // 비슷한 상품끼리 비기면(퍼피/성견 등) 1등을 보여주고 나머지는 "다른 상품일 수도" 후보로
+    const sure = (clear && top.score >= 0.75) || (top.score >= 0.35 && lastPick === key);
+    lastPick = top.score >= 0.35 ? key : null;
+    if (!sure) return;
+    const now = Date.now();
+    if (key === lastShownKey && now - lastShownAt < 8000) return; // 같은 상품 반복 표시 방지
+    lastShownKey = key; lastShownAt = now; lastPick = null;
+    els.viewport.classList.add('hit');
+    setTimeout(() => els.viewport.classList.remove('hit'), 400);
+    showPhotoResult(text, found);
   }
 
   function onDetected(code) {
@@ -839,8 +891,7 @@
     }
   }
 
-  function showPhotoResult(text) {
-    const found = matchGroups(text);
+  function showPhotoResult(text, found = matchGroups(text)) {
     els.register.hidden = true;
     els.result.hidden = false;
     const raw = document.createElement('details');
