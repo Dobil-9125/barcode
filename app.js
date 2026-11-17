@@ -636,7 +636,7 @@
     running = true;
     els.btnCamera.textContent = '카메라 끄기';
     const ocrOn = startLiveOcr();
-    setStatus(ocrOn ? '바코드나 포장의 영어 이름을 비춰 주세요. 찾으면 바로 넘어가요.' : '바코드를 네모 칸 안에 가로로 맞춰 주세요.');
+    setStatus(ocrOn ? '바코드나 포장 앞면을 비춰 주세요. 찾으면 바로 넘어가요.' : '바코드를 네모 칸 안에 가로로 맞춰 주세요.');
     requestAnimationFrame(tick);
   }
 
@@ -676,19 +676,138 @@
     } catch { /* 다음 프레임에서 다시 */ } finally { busy = false; }
   }
 
-  /* 카메라를 비추는 동안 포장 글자도 계속 읽다가, 확실하면 바로 결과로 넘어감 */
+  /* ---------- 포장 그림으로 찾기 (vision-worker.js) ----------
+   * 글자를 못 읽어도 포장 디자인(그림, 로고 배치)이 상품 사진과 맞는지 비교
+   * 같은 사진을 쓰는 상품(맛만 다른 캔 등)은 글자 점수로 순서를 정함
+   */
+  let vision = null, visionReq = 0, refUrls = new Map(), refsSig = '', refsJob = null;
+  const visionWait = new Map();
+  function getVision() {
+    if (vision || window.PREVIEW_NO_OCR || !window.Worker) return vision;
+    try { vision = new Worker('vision-worker.js'); } catch { return null; }
+    vision.onmessage = (e) => {
+      const m = e.data;
+      if (m.type === 'result' && visionWait.has(m.req)) { visionWait.get(m.req)(m); visionWait.delete(m.req); }
+    };
+    return vision;
+  }
+  function toGray(src, sw, sh, max) {
+    const s = Math.min(1, max / Math.max(sw, sh));
+    const w = Math.round(sw * s), h = Math.round(sh * s);
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(src, 0, 0, w, h);
+    const d = ctx.getImageData(0, 0, w, h).data, gray = new Uint8Array(w * h);
+    for (let i = 0, j = 0; j < gray.length; i += 4, j++) gray[j] = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8;
+    return { w, h, gray };
+  }
+  // 상품 사진들을 비교 기준으로 등록 (데이터가 바뀌었을 때만 다시)
+  function buildRefs() {
+    const wk = getVision();
+    if (!wk) return Promise.resolve(0);
+    const map = new Map();
+    for (const list of groups.values()) {
+      const url = (list.find((p) => p.image) || {}).image;
+      if (!url) continue;
+      if (!map.has(url)) map.set(url, []);
+      map.get(url).push(list);
+    }
+    const sig = [...map.keys()].join('\n') + '|' + groups.size;
+    if (sig === refsSig && refsJob) return refsJob;
+    refsSig = sig;
+    wk.postMessage({ type: 'clear' });
+    const next = new Map();
+    refsJob = Promise.all([...map].map(([url, lists]) => new Promise((res) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        try {
+          const g = toGray(img, img.naturalWidth, img.naturalHeight, 640);
+          wk.postMessage({ type: 'ref', id: url, ...g }, [g.gray.buffer]);
+          next.set(url, lists);
+        } catch { /* 다른 사이트 사진은 읽을 수 없어 건너뜀 */ }
+        res();
+      };
+      img.onerror = () => res();
+      img.src = url;
+    }))).then(() => { refUrls = next; return next.size; });
+    return refsJob;
+  }
+  function visualMatch(src, sw, sh) {
+    const wk = getVision();
+    if (!wk || !refUrls.size) return Promise.resolve(null);
+    const g = toGray(src, sw, sh, 720);
+    const req = ++visionReq;
+    return new Promise((res) => {
+      visionWait.set(req, res);
+      wk.postMessage({ type: 'match', req, ...g }, [g.gray.buffer]);
+      setTimeout(() => { if (visionWait.has(req)) { visionWait.delete(req); res(null); } }, 10000);
+    });
+  }
+  // 그림 비교: 1등과 비슷하게 맞은 사진들(같은 라인의 맛만 다른 상품 등)을 후보로 모아
+  // 글자에서 맛 이름 등이 읽혔으면 그 상품을 앞으로
+  function visualPick(vr, text) {
+    if (!vr || !vr.results.length) return null;
+    const [a, b] = vr.results;
+    if (!refUrls.get(a.id)) return null;
+    const second = b ? b.inliers : 0;
+    const sure = (a.inliers >= 12 && a.inliers >= 1.5 * second) || (a.inliers >= 20 && a.inliers >= 1.15 * second);
+    const ocr = matchGroups(text || '');
+    const scoreOf = (list) => (ocr.find((f) => f.list === list) || {}).score || 0;
+    const found = [];
+    vr.results.forEach((r, rank) => {
+      if (rank > 0 && (r.inliers < 8 || r.inliers < a.inliers * 0.75)) return;
+      for (const list of refUrls.get(r.id) || []) if (!found.some((f) => f.list === list)) found.push({ list, score: scoreOf(list), inl: r.inliers });
+    });
+    found.sort((x, y) => (y.score - x.score) || (y.inl - x.inl));
+    return { sure, found: found.slice(0, 4), inliers: a.inliers, id: a.id };
+  }
+
+  /* 카메라를 비추는 동안 포장 그림과 글자를 계속 비교하다가, 확실하면 바로 결과로 넘어감 */
   let liveOcr = false, ocrBusy = false, ocrTimer = 0, lastPick = null, lastShownKey = '', lastShownAt = 0;
   const ocrFrame = document.createElement('canvas');
+  let liveVis = false, visBusy = false, visTimer = 0, lastVis = null, lastText = '';
   function startLiveOcr() {
-    if (window.PREVIEW_NO_OCR || !window.Tesseract) return false;
-    if (![...groups.values()].some((l) => l.some((p) => p.english))) return false;
-    liveOcr = true; lastPick = null;
-    getOcr().catch(() => { liveOcr = false; });
-    clearTimeout(ocrTimer);
-    ocrTimer = setTimeout(ocrLoop, 600);
-    return true;
+    if (window.PREVIEW_NO_OCR) return false;
+    lastPick = null; lastVis = null; lastText = '';
+    if (window.Tesseract && [...groups.values()].some((l) => l.some((p) => p.english))) {
+      liveOcr = true;
+      getOcr().catch(() => { liveOcr = false; });
+      clearTimeout(ocrTimer);
+      ocrTimer = setTimeout(ocrLoop, 600);
+    }
+    if (getVision() && [...groups.values()].some((l) => l.some((p) => p.image))) {
+      liveVis = true;
+      clearTimeout(visTimer);
+      buildRefs().then(() => { if (running && liveVis) visTimer = setTimeout(visionLoop, 100); });
+    }
+    return liveOcr || liveVis;
   }
-  function stopLiveOcr() { liveOcr = false; clearTimeout(ocrTimer); }
+  function stopLiveOcr() { liveOcr = false; liveVis = false; clearTimeout(ocrTimer); clearTimeout(visTimer); }
+  async function visionLoop() {
+    if (!running || !liveVis) return;
+    const v = els.video;
+    if (!visBusy && v.readyState >= 2 && v.videoWidth) {
+      visBusy = true;
+      try {
+        const vp = visualPick(await visualMatch(v, v.videoWidth, v.videoHeight), lastText);
+        // 같은 사진이 두 번 연속 확실하게 나와야 넘어감
+        if (vp && vp.sure) {
+          if (lastVis === vp.id) { lastVis = null; if (running && liveVis) showLive(vp.found, lastText); } else lastVis = vp.id;
+        } else lastVis = null;
+      } catch { /* 다음 번에 다시 */ } finally { visBusy = false; }
+    }
+    if (running && liveVis) visTimer = setTimeout(visionLoop, 150);
+  }
+  function showLive(found, text) {
+    const key = groupKey(found[0].list[0]);
+    const now = Date.now();
+    if (key === lastShownKey && now - lastShownAt < 8000) return; // 같은 상품 반복 표시 방지
+    lastShownKey = key; lastShownAt = now; lastPick = null;
+    els.viewport.classList.add('hit');
+    setTimeout(() => els.viewport.classList.remove('hit'), 400);
+    showPhotoResult(text, found);
+  }
   async function ocrLoop() {
     if (!running || !liveOcr) return;
     const v = els.video;
@@ -702,7 +821,8 @@
         c.filter = 'grayscale(1) contrast(1.3)';
         c.drawImage(v, 0, 0, ocrFrame.width, ocrFrame.height);
         const { data } = await worker.recognize(ocrFrame);
-        if (running && liveOcr) judgeLive(data.text || '');
+        lastText = data.text || '';
+        if (running && liveOcr) judgeLive(lastText);
       } catch { /* 다음 번에 다시 */ } finally { ocrBusy = false; }
     }
     if (running && liveOcr) ocrTimer = setTimeout(ocrLoop, 250);
@@ -715,15 +835,10 @@
     const key = groupKey(top.list[0]);
     const clear = !found[1] || top.score >= found[1].score * 1.25;
     // 비슷한 상품끼리 비기면(퍼피/성견 등) 1등을 보여주고 나머지는 "다른 상품일 수도" 후보로
-    const sure = (clear && top.score >= 0.75) || (top.score >= 0.35 && lastPick === key);
-    lastPick = top.score >= 0.35 ? key : null;
+    const sure = (clear && top.score >= 0.7) || (top.score >= 0.45 && lastPick === key);
+    lastPick = top.score >= 0.45 ? key : null;
     if (!sure) return;
-    const now = Date.now();
-    if (key === lastShownKey && now - lastShownAt < 8000) return; // 같은 상품 반복 표시 방지
-    lastShownKey = key; lastShownAt = now; lastPick = null;
-    els.viewport.classList.add('hit');
-    setTimeout(() => els.viewport.classList.remove('hit'), 400);
-    showPhotoResult(text, found);
+    showLive(found, text);
   }
 
   function onDetected(code) {
@@ -804,6 +919,9 @@
       langPath: window.TESSERACT_LANG_PATH || VENDOR + 'lang',
       gzip: true,
       logger: (m) => onProgress && onProgress(m),
+    }).then(async (w) => {
+      if (window.OCR_PSM) await w.setParameters({ tessedit_pageseg_mode: String(window.OCR_PSM) });
+      return w;
     }).catch((e) => { ocrWorker = null; throw e; });
     return ocrWorker;
   }
@@ -891,21 +1009,26 @@
   }
 
   async function findByPhoto(file) {
-    const named = [...groups.values()].filter((l) => l.some((p) => p.english)).length;
-    if (!named) {
-      setStatus('아직 영문명이 들어간 상품이 없어요. 데이터의 "영문명" 칸을 채우면 사진으로 찾을 수 있어요.', true);
+    const all = [...groups.values()];
+    if (!all.some((l) => l.some((p) => p.english || p.image))) {
+      setStatus('아직 영문명이나 사진이 들어간 상품이 없어요. 데이터의 "영문명", "이미지" 칸을 채우면 사진으로 찾을 수 있어요.', true);
       return;
     }
-    setStatus('글자 인식 준비 중… (처음 한 번은 몇 초 걸려요)');
+    setStatus('포장 그림과 글자를 비교하는 중… (처음 한 번은 몇 초 걸려요)');
     try {
-      const worker = await getOcr((m) => {
-        if (m.status === 'recognizing text') setStatus(`포장의 글자를 읽는 중… ${Math.round(m.progress * 100)}%`);
-      });
       const canvas = await prepareForOcr(file);
-      const { data } = await worker.recognize(canvas);
-      showPhotoResult(data.text || '');
+      const [vr, text] = await Promise.all([
+        buildRefs().then(() => visualMatch(canvas, canvas.width, canvas.height)).catch(() => null),
+        getOcr((m) => {
+          if (m.status === 'recognizing text') setStatus(`포장 그림과 글자를 비교하는 중… ${Math.round(m.progress * 100)}%`);
+        }).then((w) => w.recognize(canvas)).then((r) => r.data.text || '').catch(() => ''),
+      ]);
+      const vp = visualPick(vr, text);
+      // 그림이 확실하거나, 그림이 어느 정도 맞고 글자도 그 상품을 가리키면 그림 결과로
+      if (vp && (vp.sure || vp.inliers >= 15 || (vp.inliers >= 8 && vp.found.some((f) => f.score > 0)))) showPhotoResult(text, vp.found);
+      else showPhotoResult(text);
     } catch (e) {
-      setStatus(`글자를 읽지 못했어요. (${e && e.message ? e.message : e})`, true);
+      setStatus(`사진을 읽지 못했어요. (${e && e.message ? e.message : e})`, true);
     }
   }
 
@@ -946,6 +1069,7 @@
       renderGroup(list, list.length === 1 ? list[0] : null, extra);
     };
     render(0);
+    els.result.dataset.score = found[0].score.toFixed(2);
     setStatus(found[0].list.length > 1 ? '상품을 찾았어요. 용량을 골라 주세요.' : '상품을 찾았어요.');
     feedback();
     els.result.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
